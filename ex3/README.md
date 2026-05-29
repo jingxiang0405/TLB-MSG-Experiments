@@ -1,304 +1,372 @@
-# 實驗 3：Kernel Slab Allocator 觀察
+# 實驗 3：Pipe Spray 與 Slab Allocator Lifecycle 觀察
 
-## 實驗目的
+## 1. 實驗目的
 
-本實驗的目的不是重現 kernel exploit，也不是洩漏真實 kernel object 位址，而是觀察 Linux SLUB/slab allocator 的基本行為，建立後續理解論文攻擊鏈所需的 allocator 背景。
+本實驗的目的不是重現 kernel exploit，也不是執行 privilege escalation，而是在觀察一個真實 user-space allocation primitive 對 Linux kernel slab allocator 的影響。
 
-本實驗要驗證三件事：
+本實驗觀察三個階段：
 
-1. Linux kernel 會把小型 kernel objects 放入固定大小的 slab cache。
-2. 若已知某個 slab page 的 page-aligned base address，可以根據 cache 的 object size 推導 page 內所有 object slot 的候選位址。
-3. User-space 程式可以透過大量建立 kernel objects，例如 pipes，間接改變 kernel slab allocator 的狀態。
+```text
+before  →  hold  →  after
+建立 pipe 前  pipe 持有中  pipe 關閉後
+```
 
-這對應論文中的關鍵攻擊鏈：TLB side channel 先洩漏 4kB page-level address；slab allocator 的固定 slot layout 再把 page-level leak 轉換成 object-level candidate addresses。
+要回答的問題是：
+
+1. 大量建立 pipes 時，哪些 slab cache 的 `objects` / `slabs` 會增加？
+2. pipes 關閉後，相關 cache 是否會回落？
+3. allocator 狀態是否會完全恢復到 before，或留下可被後續 allocation 重用的痕跡？
+
+這個實驗用來支撐 allocator massaging 的基本前提：攻擊者雖然不能直接控制 kernel heap layout，但可以透過大量 user-space syscall / object creation 對 kernel allocator 施加壓力，改變 slab cache 狀態。
 
 ---
 
-## 背景知識
+## 2. 實驗環境
 
-Linux kernel 的小物件通常不會直接向 page allocator 要一整個 4kB page，而是透過 slab allocator 管理。
+VM 環境：VirtualBox Ubuntu VM。
 
-簡化架構如下：
-
-```text
-Page Allocator
-  ↓ 提供 4kB 或多頁連續記憶體
-Slab Allocator
-  ↓ 把 page 切成固定大小 slot
-Kernel Objects
-  cred, file, msg_msg, pipe_buffer, seq_file, ...
-```
-
-對於一個 slab cache，最重要的欄位是：
+Kernel 與重要 config：
 
 ```text
-object_size      每個 object slot 的大小
-objs_per_slab    每個 slab 可容納多少個 object slot
-order            每個 slab 使用多少個 page
-objects          目前 cache 中的 object 數量
-slabs            目前 cache 中的 slab 數量
-partial          部分填滿的 slab 數量
-cpu_slabs        per-CPU 暫存 slab 狀態
-```
-
-其中：
-
-```text
-slab_size = 4096 × 2^order
-```
-
-例如：
-
-```text
-order = 0  → slab_size = 4096 bytes
-order = 1  → slab_size = 8192 bytes
-```
-
-若某個 cache 是 `object_size = 128` 且 `order = 0`，則：
-
-```text
-slab_size = 4096 bytes
-objects_per_slab = 4096 / 128 = 32
-object_address = slab_base + 128 × n, n = 0..31
-```
-
----
-
-## 實驗環境確認
-
-先確認 kernel 使用的是 SLUB allocator：
-
-```bash
-uname -a
-grep SLUB /boot/config-$(uname -r)
-grep SLAB /boot/config-$(uname -r)
-```
-
-預期至少看到：
-
-```text
+Linux ubuntu 6.17.0-29-generic #29~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Mon May 11 10:30:58 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
 CONFIG_SLUB=y
+# CONFIG_SLUB_TINY is not set
+# CONFIG_SLUB_STATS is not set
+CONFIG_SLUB_CPU_PARTIAL=y
+CONFIG_SLUB_DEBUG=y
+# CONFIG_SLUB_DEBUG_ON is not set
+CONFIG_STRICT_MODULE_RWX=y
+CONFIG_VMAP_STACK=y
+CONFIG_RANDOMIZE_BASE=y
 ```
-
----
-
-## Step 1：列出 slab cache
-
-執行：
-
-```bash
-ls /sys/kernel/slab | grep '^kmalloc' | head -50
-ls /sys/kernel/slab | grep '^kmalloc-cg' | head -50
-```
-
-目的：確認系統上有哪些 generic kmalloc cache，例如：
-
-```text
-kmalloc-64
-kmalloc-128
-kmalloc-256
-kmalloc-cg-64
-kmalloc-cg-128
-kmalloc-cg-256
-```
-
----
-
-## Step 2：讀取 cache layout
-
-執行 `read_cache_layout.sh`
-
-本機觀察結果：
-
-| cache | object_size | objs_per_slab | order | objects | slabs | partial | cpu_slabs |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| kmalloc-64 | 64 | 64 | 0 | 45746 | 733 | 92 | 313 |
-| kmalloc-128 | 128 | 32 | 0 | 8374 | 279 | 27 | 194 |
-| kmalloc-256 | 256 | 32 | 1 | 43053 | 1351 | 39 | 134 |
-| kmalloc-cg-64 | 64 | 64 | 0 | 6536 | 112 | 10 | 102 |
-| kmalloc-cg-128 | 128 | 32 | 0 | 768 | 24 | 0 | 24 |
-| kmalloc-cg-256 | 256 | 32 | 1 | 512 | 16 | 0 | 16 |
 
 重點解讀：
 
 ```text
-kmalloc-cg-128:
-  object_size = 128
-  objs_per_slab = 32
-  order = 0
+CONFIG_SLUB=y                  使用 SLUB allocator
+CONFIG_SLUB_CPU_PARTIAL=y      啟用 per-CPU partial slab 行為
+CONFIG_SLUB_DEBUG=y            kernel 支援 SLUB debug 功能
+CONFIG_STRICT_MODULE_RWX=y     論文中的 D1 defense 存在
+CONFIG_VMAP_STACK=y            論文中的 D3 defense 存在
+CONFIG_RANDOMIZE_BASE=y        KASLR 啟用
 ```
 
-這表示 `kmalloc-cg-128` 是最適合拿來對應論文範例的 cache：一個 4kB slab page 被切成 32 個 128-byte slots。
+這台 VM 適合做 allocator / side-channel 背景實驗。由於是 Ubuntu 6.17 generic kernel，結果不一定與論文測試的 v5.15、v6.5、v6.6、v6.8 完全一致，但足以觀察 allocator lifecycle 現象。
 
 ---
 
-## Step 3：page base → object slot candidates 推導
+## 3. 實驗與論文攻擊鏈的關係
 
-假設 TLB side channel 洩漏出某個 slab page base：
+論文的完整攻擊鏈中，allocator massaging 是 location disclosure attack 的前置條件。論文指出，單純的 syscall 或 access primitive 會接觸大量 kernel objects，因此需要先透過 allocator massaging 讓目標 object 所在頁面具有較可預測的 layout，再用 TLB side channel 洩漏 page-level location。
 
-```text
-slab_base = ffff8ae0f1203000
-```
-
-若該 page 屬於 `kmalloc-cg-128`，則：
+本實驗只做其中一個安全子問題：
 
 ```text
-object_address = slab_base + 128 × n, n = 0..31
+user-space allocation primitive 是否能改變 kernel slab allocator 狀態？
 ```
 
-候選位址：
+本實驗沒有做：
 
 ```text
-slot  0: 0xffff8ae0f1203000
-slot  1: 0xffff8ae0f1203080
-slot  2: 0xffff8ae0f1203100
-slot  3: 0xffff8ae0f1203180
-...
-slot 31: 0xffff8ae0f1203f80
+1. kernel address leak
+2. TLB prefetch scan
+3. UAF / OOB exploit
+4. 任意讀寫
+5. cred patching / privilege escalation
 ```
 
-這一步的重點：
-
-```text
-TLB side channel 給的是 4kB page-level address；
-slab allocator 的固定 slot layout 讓我們能推導 page 內所有 object slot candidates。
-```
-
-這些是候選位址，不代表已經知道每個 slot 對應哪個具體 object。論文透過 allocator massaging 解決這個問題：讓整個 slab page 盡量都放入攻擊者控制的同類 object。
+本實驗只是觀察 `pipe()` 造成的 kernel allocation lifecycle。
 
 ---
 
-## Step 4：動態觀察 user-space 對 slab allocator 的影響
+## 4. 實驗檔案
 
-1. 執行 `read_slab_cache.sh`
+本實驗使用三個程式 / 腳本。
 
-觀察結果：
+### 4.1 `pipe_spray_hold.c`
 
-| cache | objects before | slabs before | partial before |
-|---|---:|---:|---:|
-| kmalloc-64 | 45337 | 733 | 135 |
-| kmalloc-128 | 7817 | 272 | 45 |
-| kmalloc-256 | 43053 | 1361 | 52 |
-| kmalloc-cg-64 | 6536 | 112 | 10 |
-| kmalloc-cg-128 | 768 | 24 | 0 |
-| kmalloc-cg-256 | 512 | 16 | 0 |
+用途：建立大量 pipes，保持一段時間，讓觀察者可以在 pipes 還活著時讀取 `/sys/kernel/slab` 狀態。
 
-2. 執行 `fake_pipe.py`， 建立 20000 個 pipes
+編譯：
 
-先不要按 Enter 關掉
-
-3. 再次執行 `read_slab_cache.sh`
-
-觀察結果：
-
-| cache | objects after | slabs after | partial after |
-|---|---:|---:|---:|
-| kmalloc-64 | 45337 | 733 | 135 |
-| kmalloc-128 | 7817 | 272 | 45 |
-| kmalloc-256 | 44992 | 1406 | 0 |
-| kmalloc-cg-64 | 6536 | 112 | 10 |
-| kmalloc-cg-128 | 768 | 24 | 0 |
-| kmalloc-cg-256 | 512 | 16 | 0 |
-
-4. 前後差異
-
-| cache | Δ objects | Δ slabs | Δ partial |
-|---|---:|---:|---:|
-| kmalloc-64 | 0 | 0 | 0 |
-| kmalloc-128 | 0 | 0 | 0 |
-| kmalloc-256 | +1939 | +45 | -52 |
-| kmalloc-cg-64 | 0 | 0 | 0 |
-| kmalloc-cg-128 | 0 | 0 | 0 |
-| kmalloc-cg-256 | 0 | 0 | 0 |
+```bash
+gcc -Wall -Wextra -O2 pipe_spray_hold.c -o pipe_spray_hold
+```
 
 ---
 
-## 結果解讀
+### 4.2 `read_slab_snapshot.sh`
 
-主要變化集中在 `kmalloc-256`：
+用途：讀取所有 `kmalloc-*` / `kmalloc-cg-*` slab cache 的主要欄位，輸出成 snapshot 檔案。
 
-```text
-kmalloc-256:
-  objects: 43053 → 44992  (+1939)
-  slabs:   1361  → 1406   (+45)
-  partial: 52    → 0      (-52)
+建議整個腳本用 `sudo` 執行，不要在迴圈內對每個欄位個別 `sudo`。
+
+執行：
+
+```bash
+chmod +x read_slab_snapshot.sh
+sudo ./read_slab_snapshot.sh before.txt
 ```
-
-這表示大量建立 pipes 後，kernel 在 `kmalloc-256` cache 中配置了大量物件，並且新增了 45 個 slabs。
-
-由於 `kmalloc-256` 在 Step 2 中觀察到：
-
-```text
-object_size = 256
-objs_per_slab = 32
-order = 1
-```
-
-新增 45 個 slabs 代表新增容量最多：
-
-```text
-45 × 32 = 1440 slots
-```
-
-但 objects 實際增加了 1939。這不是矛盾，因為增加的 objects 來源包含：
-
-```text
-1. 新增 slab 提供的新 slots
-2. 原本 partial slabs 中尚未使用的空 slots
-```
-
-`partial` 從 52 降到 0 支持這個解釋：原本部分填滿的 slabs 被進一步填滿，甚至移出 partial list。
 
 ---
 
-## 實驗結論
+### 4.3 `diff_slab_snapshots.c`
 
-### 結論 1：本機 slab cache 具有固定 slot layout
+用途：比較三個 snapshot：`before.txt`、`hold.txt`、`after.txt`。
 
-例如：
-
-```text
-kmalloc-cg-128:
-  object_size = 128
-  order = 0
-  objs_per_slab = 32
-```
-
-因此，若知道某個 `kmalloc-cg-128` slab page 的 base address，便可推導：
+它會列出：
 
 ```text
-object_address = slab_base + 128 × n, n = 0..31
+before → hold
+hold   → after
+before → after
 ```
 
-這說明 slab allocator 的 layout 規律可以把 4kB page-level leak 轉換為 page 內 object slot candidate addresses。
-
-### 結論 2：page-level leak 足以產生 object-level candidates
-
-TLB side channel 的自然解析度是 4kB page。若目標 object 位於 order-0 slab cache，則洩漏 page base 後，可以根據 slot size 推出該 page 內所有 candidate object addresses。
-
-這不是直接知道「哪個 slot 是哪個具體 object」，但若 allocator massaging 讓整頁都是攻擊者控制的同類 object，候選位址就已經足以支撐後續 exploit。
-
-### 結論 3：user-space 行為可以改變 kernel slab allocator 狀態
-
-建立 20000 個 pipes 後，`kmalloc-256` 的狀態明顯變化：
+每個 cache 的變化包含：
 
 ```text
-objects +1939
-slabs   +45
-partial -52
+objects delta
+slabs delta
+partial delta
 ```
 
-這說明 user-space 程式可以透過 syscall/object creation 觸發大量 kernel allocation，進而改變 kernel heap layout。這支撐 allocator massaging 的基本前提。
+---
 
-### 結論 4：本實驗的限制
+## 5. 實驗流程
 
-本實驗沒有：
+### 5.1 切換工作目錄
+
+```bash
+cd ~/ex5
+```
+
+### 5.2 編譯程式
+
+```bash
+gcc -Wall -Wextra -O2 pipe_spray_hold.c -o pipe_spray_hold
+gcc -Wall -Wextra -O2 diff_slab_snapshots.c -o diff_slab_snapshots
+```
+
+### 5.3 提高 file descriptor limit
+
+建立 20000 pipes 會開約 40000 個 file descriptors，因此需要提高 limit：
+
+```bash
+ulimit -n 100000
+ulimit -n
+```
+
+### 5.4 記錄 before
+
+```bash
+sudo ./read_slab_snapshot.sh before.txt
+```
+
+### 5.5 建立並 hold 20000 pipes
+
+開另一個 terminal：
+
+```bash
+cd ~/kernel-lab/exp5-pipe-spray
+ulimit -n 100000
+./pipe_spray_hold 20000 300
+```
+
+程式會輸出類似：
 
 ```text
-1. 洩漏真實 kernel object address
-2. 定位具體 pipe_buffer 或 msg_msg object
-3. 進行 UAF/OOB exploit
-4. 重現論文完整 TLB side-channel attack
+created pipes: 20000
+open file descriptors: approximately 40000
+pid: <pid>
+holding for 300 seconds; observe /sys/kernel/slab in another terminal
 ```
 
-本實驗的定位是 allocator 結構觀察，用於理解論文攻擊鏈中「TLB page leak → slab slot inference → object candidate addresses」這一段。
+### 5.6 在 hold 期間記錄 hold
+
+回到第一個 terminal：
+
+```bash
+sudo ./read_slab_snapshot.sh hold.txt
+```
+
+### 5.7 pipes 關閉後記錄 after
+
+等 `pipe_spray_hold` 結束後：
+
+```bash
+sudo ./read_slab_snapshot.sh after.txt
+```
+
+### 5.8 比較三個 snapshot
+
+```bash
+./diff_slab_snapshots before.txt hold.txt after.txt
+```
+
+---
+
+## 6. 實驗結果
+
+### 6.1 before → hold
+
+`before → hold` 代表 pipes 還活著時 allocator 的變化。
+
+變化最大的幾個 cache：
+
+| cache | size | objs_per_slab | order | objects before | objects hold | Δ objects | slabs before | slabs hold | Δ slabs | Δ partial |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kmalloc-rnd-05-512 | 512 | 16 | 1 | 1244 | 2110 | +866 | 80 | 132 | +52 | -11 |
+| kmalloc-rnd-05-192 | 192 | 21 | 0 | 4668 | 5523 | +855 | 237 | 263 | +26 | -60 |
+| kmalloc-rnd-05-128 | 128 | 32 | 0 | 1408 | 2144 | +736 | 44 | 67 | +23 | 0 |
+| kmalloc-cg-1k | 1024 | 16 | 2 | 356 | 848 | +492 | 28 | 53 | +25 | -15 |
+| kmalloc-cg-192 | 192 | 21 | 0 | 507 | 756 | +249 | 31 | 36 | +5 | -8 |
+| kmalloc-rnd-03-32 | 32 | 128 | 0 | 896 | 1122 | +226 | 7 | 9 | +2 | +2 |
+| kmalloc-rcl-96 | 96 | 42 | 0 | 547 | 714 | +167 | 14 | 17 | +3 | -6 |
+| kmalloc-rcl-128 | 128 | 32 | 0 | 320 | 480 | +160 | 10 | 15 | +5 | 0 |
+
+解讀：
+
+```text
+建立 20000 pipes 期間，多個 kmalloc cache 的 objects/slabs 明顯增加。
+這表示 pipe() 不是只配置單一 kernel object，而是造成多種 kernel allocations。
+```
+
+最明顯的 cache 是 `kmalloc-rnd-05-512`、`kmalloc-rnd-05-192`、`kmalloc-rnd-05-128`、`kmalloc-cg-1k`。
+
+---
+
+### 6.2 hold → after
+
+`hold → after` 代表 pipes 關閉後 allocator 的變化。
+
+主要回落的 cache：
+
+| cache | size | objs_per_slab | order | objects hold | objects after | Δ objects | slabs hold | slabs after | Δ slabs | Δ partial |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kmalloc-cg-192 | 192 | 21 | 0 | 756 | 323 | -433 | 36 | 24 | -12 | +12 |
+| kmalloc-cg-1k | 1024 | 16 | 2 | 848 | 364 | -484 | 53 | 35 | -18 | +23 |
+| kmalloc-rnd-05-192 | 192 | 21 | 0 | 5523 | 5459 | -64 | 263 | 263 | 0 | +12 |
+| kmalloc-rnd-11-96 | 96 | 42 | 0 | 507 | 447 | -60 | 20 | 18 | -2 | -1 |
+
+解讀：
+
+```text
+pipes 關閉後，部分 cache 的 objects/slabs 下降，表示部分 kernel objects 被釋放。
+但不是所有 cache 都回落，也不是所有 slabs 都被歸還。
+```
+
+特別是 `kmalloc-rnd-05-192`：
+
+```text
+objects 下降 64
+slabs 不變
+```
+
+這表示 object 被釋放後，allocator 可能仍保留 slab capacity，等待後續 allocation 重用。
+
+---
+
+### 6.3 before → after
+
+`before → after` 最能觀察 allocator 是否完全恢復。
+
+部分仍然維持高水位的 cache：
+
+| cache | size | objs_per_slab | order | objects before | objects after | Δ objects | slabs before | slabs after | Δ slabs | Δ partial |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| kmalloc-rnd-05-512 | 512 | 16 | 1 | 1244 | 2110 | +866 | 80 | 132 | +52 | -11 |
+| kmalloc-rnd-05-192 | 192 | 21 | 0 | 4668 | 5459 | +791 | 237 | 263 | +26 | -48 |
+| kmalloc-rnd-05-128 | 128 | 32 | 0 | 1408 | 2144 | +736 | 44 | 67 | +23 | 0 |
+| kmalloc-cg-16 | 16 | 256 | 0 | 1517 | 1855 | +338 | 6 | 8 | +2 | 0 |
+| kmalloc-rnd-03-32 | 32 | 128 | 0 | 896 | 1122 | +226 | 7 | 9 | +2 | +2 |
+| kmalloc-rcl-96 | 96 | 42 | 0 | 547 | 714 | +167 | 14 | 17 | +3 | -6 |
+| kmalloc-rcl-128 | 128 | 32 | 0 | 320 | 480 | +160 | 10 | 15 | +5 | 0 |
+
+解讀：
+
+```text
+pipe_spray_hold 結束後，部分 cache 仍然比 before 有更高的 objects/slabs。
+這表示 allocator 狀態沒有完全恢復到初始狀態。
+```
+
+---
+
+## 7. 對 `kmalloc-rnd-*` 的觀察
+
+本次 VM 結果中出現大量 `kmalloc-rnd-*` cache，例如：
+
+```text
+kmalloc-rnd-05-128
+kmalloc-rnd-05-192
+kmalloc-rnd-05-512
+```
+
+這表示此 kernel 對 kmalloc cache 做了 randomized cache 分流或類似機制。其效果是：allocation site 不一定落在傳統單一 `kmalloc-128` / `kmalloc-256` / `kmalloc-512`，而可能被分散到多個 randomized kmalloc cache。
+
+對 exploit 場景的含義：
+
+```text
+1. allocator layout 的不確定性增加
+2. 傳統只看 kmalloc-128/256/512 的觀察方式不夠
+3. 需要觀察所有 kmalloc-* / kmalloc-cg-* / kmalloc-rnd-* cache
+4. 但大量 pipe spray 仍然會造成明顯且可觀察的 slab 狀態變化
+```
+
+因此，本實驗不能說「某個 kmalloc-rnd-* cache 一定是 pipe_buffer」，只能說：
+
+```text
+pipe_spray_hold 造成多個 kmalloc cache 顯著變化，說明 pipe 建立涉及多種 kernel allocation。
+```
+
+若要精準定位 allocation site，需要更進一步使用 kernel debug symbols、ftrace、kprobe、BPF tracing，或閱讀 kernel source 對照 allocation path。
+
+---
+
+## 8. 實驗結論
+
+### 結論 1：pipe allocation 會明顯改變 kernel slab 狀態
+
+建立 20000 pipes 後，多個 slab cache 的 `objects` / `slabs` 明顯增加。其中變化最明顯的是：
+
+```text
+kmalloc-rnd-05-512: objects +866, slabs +52
+kmalloc-rnd-05-192: objects +855, slabs +26
+kmalloc-rnd-05-128: objects +736, slabs +23
+kmalloc-cg-1k:      objects +492, slabs +25
+```
+
+這證明 user-space 的 `pipe()` 行為會觸發大量 kernel allocations。
+
+### 結論 2：pipe 關閉後 allocator 不一定完全回到 before
+
+`hold → after` 顯示部分 cache 會回落，例如 `kmalloc-cg-1k` 和 `kmalloc-cg-192`；但 `before → after` 顯示多個 cache 仍維持比初始狀態更高的 objects/slabs。
+
+這說明 kernel heap allocator 不是「close fd 後立刻完全歸零」的模型，而是存在 cache 保留、延遲回收、partial slab 與重用行為。
+
+### 結論 3：這支撐 allocator massaging 的基本前提
+
+Allocator massaging 的核心不是直接指定某個 kernel address，而是利用大量 allocation/free 操作改變 allocator 狀態，讓後續目標 object 更可能落入攻擊者預期的 slab layout。
+
+本實驗觀察到：
+
+```text
+before → hold:  大量 allocation 造成 cache 增長
+hold → after:   部分 object/slab 回落
+before → after: allocator 狀態不完全恢復
+```
+
+這正是 memory reuse 與 allocator massaging 能成立的現象基礎。
+
+### 結論 4：本實驗仍不是 exploit
+
+本實驗沒有洩漏 kernel address，也沒有利用 kernel vulnerability。它只是觀察 allocator lifecycle。
+
+本實驗可以作為後續安全實驗的基礎，例如：
+
+```text
+1. 重複性測試：連續跑多次 before/hold/after，看變化是否穩定
+2. ftrace / kprobe / BPF tracing：追蹤 pipe 相關 allocation site
+3. user-space common/differential pattern 模擬：不掃 kernel address，只驗證 pattern extraction
+```
+
+---
