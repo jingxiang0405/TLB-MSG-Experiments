@@ -52,29 +52,29 @@ cat /proc/slabinfo | grep -E "^(kmalloc-cg-128|msg_msg)"
 
 ```bash
 # 每個物件的大小
-cat /sys/kernel/slab/kmalloc-cg-128/object_size
+sudo cat /sys/kernel/slab/kmalloc-cg-128/object_size
 
 # 每個 slab page 有幾個物件
-cat /sys/kernel/slab/kmalloc-cg-128/objs_per_slab
+sudo cat /sys/kernel/slab/kmalloc-cg-128/objs_per_slab
 
 # slab page 的 order（大小 = 2^order × 4kB）
-cat /sys/kernel/slab/kmalloc-cg-128/order
+sudo cat /sys/kernel/slab/kmalloc-cg-128/order
 
 # 物件的對齊要求
-cat /sys/kernel/slab/kmalloc-cg-128/align
+sudo cat /sys/kernel/slab/kmalloc-cg-128/align
 ```
 
 ### 分配前後對比
 
 ```bash
 # 分配前
-grep kmalloc-cg-128 /proc/slabinfo
+sudo grep kmalloc-cg-128 /proc/slabinfo
 
 # 執行分配程式
 sudo ./slab_observe
 
 # 分配後
-grep kmalloc-cg-128 /proc/slabinfo
+sudo grep kmalloc-cg-128 /proc/slabinfo
 ```
 
 ---
