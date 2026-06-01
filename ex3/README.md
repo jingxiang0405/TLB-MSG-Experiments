@@ -4,7 +4,6 @@
 
 不寫攻擊程式，直接用 Linux 核心提供的介面觀察 Slab Allocator 的狀態，
 理解「同類物件住在同一個 slab page」的具體結構，
-為實驗 4（SLUBStick）和實驗 5（Allocator Massaging）建立基礎。
 
 ---
 
@@ -72,7 +71,7 @@ cat /sys/kernel/slab/kmalloc-cg-128/align
 grep kmalloc-cg-128 /proc/slabinfo
 
 # 執行分配程式
-./slab_observe
+sudo ./slab_observe
 
 # 分配後
 grep kmalloc-cg-128 /proc/slabinfo
@@ -80,102 +79,11 @@ grep kmalloc-cg-128 /proc/slabinfo
 
 ---
 
-## 程式碼
-
-```c
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/ipc.h>
-#include <sys/msg.h>
-
-#define MSG_PAYLOAD  72
-#define ALLOC_COUNT  64    /* 2 個 slab page 的量（32×2）*/
-
-struct msgbuf { long mtype; char mtext[MSG_PAYLOAD]; };
-
-long read_slabinfo(const char *cache_name) {
-    FILE *f = fopen("/proc/slabinfo", "r");
-    if (!f) return -1;
-    char line[512];
-    fgets(line, sizeof(line), f);
-    fgets(line, sizeof(line), f);
-    while (fgets(line, sizeof(line), f)) {
-        char name[128];
-        long active_objs, num_objs, objsize, objperslab, pagesperslab;
-        if (sscanf(line, "%127s %ld %ld %ld %ld %ld",
-                   name, &active_objs, &num_objs,
-                   &objsize, &objperslab, &pagesperslab) >= 5)
-            if (strcmp(name, cache_name) == 0) {
-                fclose(f);
-                return active_objs;
-            }
-    }
-    fclose(f);
-    return -1;
-}
-
-long read_slab_attr(const char *cache_name, const char *field) {
-    char path[256];
-    snprintf(path, sizeof(path),
-             "/sys/kernel/slab/%s/%s", cache_name, field);
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    long val = -1;
-    fscanf(f, "%ld", &val);
-    fclose(f);
-    return val;
-}
-
-int main() {
-    struct msgbuf buf = {.mtype = 1};
-    memset(buf.mtext, 'A', MSG_PAYLOAD);
-
-    const char *cache_name = "kmalloc-cg-128";
-
-    // 步驟 1：讀取靜態結構
-    long objsize  = read_slab_attr(cache_name, "object_size");
-    long objs_per = read_slab_attr(cache_name, "objs_per_slab");
-    long order    = read_slab_attr(cache_name, "order");
-    long align    = read_slab_attr(cache_name, "align");
-
-    printf("object_size   = %ld bytes\n", objsize);
-    printf("objs_per_slab = %ld 個\n",   objs_per);
-    printf("order         = %ld → slab page 大小 = %ldkB\n",
-           order, (1L << order) * 4);
-    printf("align         = %ld bytes\n\n", align);
-
-    // 步驟 2：分配前後對比
-    long before = read_slabinfo(cache_name);
-    printf("分配前 active_objs = %ld\n", before);
-
-    int qids[ALLOC_COUNT];
-    for (int i = 0; i < ALLOC_COUNT; i++) {
-        qids[i] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
-        msgsnd(qids[i], &buf, MSG_PAYLOAD, 0);
-    }
-
-    long after = read_slabinfo(cache_name);
-    printf("分配後 active_objs = %ld\n", after);
-    printf("增加了 %ld 個物件\n\n", after - before);
-
-    // 步驟 3：釋放後觀察
-    for (int i = 0; i < ALLOC_COUNT; i++)
-        msgctl(qids[i], IPC_RMID, NULL);
-
-    long freed = read_slabinfo(cache_name);
-    printf("釋放後 active_objs = %ld\n", freed);
-
-    return 0;
-}
-```
-
 ## 編譯與執行
 
 ```bash
 gcc -O0 -o slab_observe slab_observe.c
-./slab_observe
+sudo ./slab_observe
 ```
 
 ---
@@ -191,14 +99,6 @@ order         = 0            （slab page 大小 = 2^0 × 4kB = 4kB）
 align         = 128 bytes   （物件的對齊要求）
 
 驗算：4096B ÷ 128B = 32 個物件  ✓
-```
-
-### 分配前後的 active_objs
-
-```
-分配前 active_objs = 64
-分配後 active_objs = 64    ← VM 環境下 slabinfo 可能不即時更新
-釋放後 active_objs = 64
 ```
 
 > **VM 注意事項：** VirtualBox 環境下，`/proc/slabinfo` 的 `active_objs`
@@ -264,22 +164,3 @@ cat /proc/slabinfo | grep kmalloc-cg
 | slab page 大小 = 4kB | 確認是 4kB 映射，TLB 側通道才有效 |
 
 最後一點特別重要：slab page 是 4kB（order=0），所以它在 DPM 中佔用一個 4kB 頁面。論文的防禦機制（D1/D2/D3）把這個 4kB 頁面暴露在 TLB 側通道下，讓攻擊者能找到 `slab_base`。
-
----
-
-## 實驗 3→4→5 的銜接
-
-```
-實驗 3（本實驗）：靜態觀察
-  └─ 確認：msg_msg 在 kmalloc-cg-128
-           每頁 32 個 slot，間距 128 bytes
-           slab page = 4kB（可被 TLB 側通道感知）
-           ↓
-實驗 4（SLUBStick）：動態感知
-  └─ 用分配時間偵測新 slab page 的建立
-     驗證慢分配週期 ≈ 32（與實驗 3 的結構一致）
-           ↓
-實驗 5（Allocator Massaging）：主動控制
-  └─ Drain + SLUBStick，把整頁填滿攻擊者的物件
-     得到 slab_base 後，32 個物件的位址全部算出來
-```
