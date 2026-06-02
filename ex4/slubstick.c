@@ -65,7 +65,7 @@ int main() {
     }
 
     /* -----------------------------------------------
-     * 步驟 2：找閾值（中位數 × 5）
+     * 步驟 2：找閾值（中位數 × 2）
      * ----------------------------------------------- */
     uint64_t sorted[ALLOC_COUNT];
     memcpy(sorted, times, sizeof(times));
@@ -77,10 +77,10 @@ int main() {
                 sorted[j+1] = t;
             }
     uint64_t median    = sorted[ALLOC_COUNT / 2];
-    uint64_t threshold = median * 5;
+    uint64_t threshold = median * 2;
 
     printf("  中位數（快分配）：%lu cycles\n", median);
-    printf("  閾值（中位數×5）：%lu cycles\n", threshold);
+    printf("  閾值（中位數×2）：%lu cycles\n", threshold);
     printf("  超過閾值 = 新 slab page 被建立\n\n");
 
     /* -----------------------------------------------
@@ -153,30 +153,18 @@ int main() {
     }
 
     /* -----------------------------------------------
-     * 步驟 6：詳細時間表（前 80 筆）
+     * 步驟 6：詳細時間表
      * ----------------------------------------------- */
-    printf("\n步驟 5：詳細時間表（前 80 筆）\n\n");
+    printf("\n步驟 5：詳細時間表 \n\n");
     printf("  %-6s %-16s %s\n", "編號", "時間(cycles)", "");
     printf("  %-6s %-16s %s\n", "----", "------------", "");
-    for (int i = 0; i < 80 && i < ALLOC_COUNT; i++) {
+    for (int i = 0; i < ALLOC_COUNT; i++) {
         if (times[i] >= threshold)
             printf("  %-6d %-16lu ◀ 慢！新 slab page\n", i, times[i]);
         else
             printf("  %-6d %-16lu\n", i, times[i]);
     }
 
-    /* -----------------------------------------------
-     * 結論
-     * ----------------------------------------------- */！
-    printf("\n=== 結論 ===\n\n");
-    printf("  快分配 ≈ %lu cycles → 現有 slab page 有空位\n", median);
-    printf("  慢分配 >> %lu cycles → 新 slab page 被建立\n\n", threshold);
-    printf("  每隔約 32 次分配出現一次「慢」\n");
-    printf("  → 確認每個 slab page 有 32 個 slot\n\n");
-    printf("  攻擊者利用這個時間訊號，\n");
-    printf("  把連續 32 個快分配識別為「同一個 slab page 的物件」\n");
-    printf("  為下一步的 Allocator Massaging 做準備。\n");
-    printf("  （這就是論文引用的 SLUBStick 技術）\n");
 
     /* 清理 */
     for (int i = 0; i < ALLOC_COUNT; i++)
